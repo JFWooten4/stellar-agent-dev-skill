@@ -183,7 +183,7 @@ export default function LandingPage() {
             Skills built and maintained by the Stellar community. Each project
             has its own install instructions, so follow the link on a card to
             set it up with your agent. The resources listed here are
-            community-contributed and are not endorsed by the Stellar
+            community-contributed and are not endorsed by the Stellar development
             Foundation. Always do your own research (DYOR) before using any
             tool or resource. Inclusion in this list does not imply any
             warranty, security audit, or official recommendation.
