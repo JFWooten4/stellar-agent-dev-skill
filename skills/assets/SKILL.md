@@ -1,23 +1,23 @@
 ---
 name: assets
-description: Stellar Assets (classic) + trustlines + Stellar Asset Contract (SAC) bridge to Soroban. Covers asset issuance, distribution, authorization flags, clawback, regulated assets, trustline management, and the SAC interop layer that exposes classic assets as Soroban tokens. Use when tokenizing real-world assets, issuing stablecoins, managing trustlines, or bridging classic assets to Soroban contracts.
+description: Stellar Assets (classic) + trustlines + Stellar Asset Contract (SAC) bridge to smart contracts. Covers asset issuance, distribution, authorization flags, clawback, regulated assets, trustline management, and the SAC interop layer that exposes classic assets as SEP-41 contract tokens. Use when tokenizing real-world assets, issuing stablecoins, managing trustlines, or bridging classic assets to smart contracts.
 user-invocable: true
 argument-hint: "[asset task]"
 ---
 
 # Stellar Assets, Trustlines, and SAC
 
-Stellar's native token mechanism: classic asset issuance, trustlines, and the Stellar Asset Contract (SAC) bridge that makes classic assets usable from Soroban. Default to classic assets over custom Soroban tokens unless you need custom logic.
+Stellar's native token mechanism: classic asset issuance, trustlines, and the Stellar Asset Contract (SAC) bridge that makes classic assets usable from smart contracts. Default to classic assets over custom contract tokens unless you need custom logic.
 
 ## When to use this skill
 - Issuing a new asset (stablecoin, security token, utility token)
 - Setting up trustlines from a client or contract
 - Managing issuer flags (auth required, auth revocable, clawback)
-- Bridging a classic asset into a Soroban contract via SAC
+- Bridging a classic asset into a smart contract via SAC
 - Building regulated-asset flows (compliance, KYC, freeze)
 
 ## Related skills
-- Custom token contracts (when classic isn't enough) → `../soroban/SKILL.md`
+- Custom token contracts (when classic isn't enough) → `../smart-contracts/SKILL.md`
 - UI flows for trustline creation and asset display → `../dapp/SKILL.md`
 - Looking up balances and trustline state → `../data/SKILL.md`
 - Token-related SEPs (SEP-41, SEP-7, etc.) → `../standards/SKILL.md`
@@ -30,7 +30,7 @@ Stellar's native token mechanism: classic asset issuance, trustlines, and the St
 Stellar has two token mechanisms:
 
 1. **Stellar Assets (Classic)**: Built-in, highly efficient, full ecosystem support
-2. **Soroban Tokens**: Custom contracts with flexible logic
+2. **Contract tokens (SEP-41)**: Custom contracts with flexible logic
 
 **Recommendation**: Prefer Stellar Assets unless you need custom token logic.
 
@@ -71,14 +71,15 @@ const usdc = new StellarSdk.Asset(
 import * as StellarSdk from "@stellar/stellar-sdk";
 
 const server = new StellarSdk.Horizon.Server("https://horizon-testnet.stellar.org");
+const rpcServer = new StellarSdk.rpc.Server("https://soroban-testnet.stellar.org");
 
 // 1. Create issuing account (should be separate from distribution)
 const issuerKeypair = StellarSdk.Keypair.random();
 const distributorKeypair = StellarSdk.Keypair.random();
 
-// 2. Fund accounts (testnet)
-await fetch(`https://friendbot.stellar.org?addr=${issuerKeypair.publicKey()}`);
-await fetch(`https://friendbot.stellar.org?addr=${distributorKeypair.publicKey()}`);
+// 2. Fund accounts (testnet). fundAddress throws if funding fails.
+await rpcServer.fundAddress(issuerKeypair.publicKey());
+await rpcServer.fundAddress(distributorKeypair.publicKey());
 ```
 
 ### Issue Asset
@@ -128,7 +129,7 @@ await server.submitTransaction(issueTx);
 
 ### Lock Issuing Account
 
-For fixed-supply tokens, lock the issuer:
+For fixed-supply tokens, lock the issuer. Master weight 0 disables only the master key, so first remove any other signers (or confirm their combined weight can never meet the account's thresholds):
 
 ```typescript
 const lockTx = new StellarSdk.TransactionBuilder(issuerAccount, {
@@ -145,7 +146,7 @@ const lockTx = new StellarSdk.TransactionBuilder(issuerAccount, {
 
 lockTx.sign(issuerKeypair);
 await server.submitTransaction(lockTx);
-// Issuer can never issue more tokens
+// With no other signers, the issuer can never issue more tokens
 ```
 
 ## Asset Flags
@@ -231,11 +232,83 @@ const changeTrustTx = new StellarSdk.TransactionBuilder(userAccount, {
   .addOperation(
     StellarSdk.Operation.changeTrust({
       asset: asset,
-      limit: "10000", // 0 to remove trustline
+      limit: "10000", // Max amount to hold (see "Remove Trustline" for limit: "0")
     })
   )
   .setTimeout(180)
   .build();
+```
+
+### Remove Trustline
+
+`ChangeTrust` with `limit: "0"` deletes a trustline, but only if the trustline
+is in a deletable state. Before submitting:
+
+1. **Identify the asset by code AND issuer.** A wallet-display entry or a
+   claimable balance is not a trustline — only an actual classic asset
+   trustline (or liquidity pool share) on the account can be removed with
+   `ChangeTrust`. Claimable balances are removed by claiming or clawing them
+   back, not by `ChangeTrust`.
+2. **Clear the balance.** The trustline balance must be exactly `0` — send
+   remaining funds back to the issuer (burns them) or to another account.
+3. **Clear offers / buying liabilities.** Open DEX offers that buy the asset
+   create buying liabilities; cancel them before removal (`manageSellOffer`
+   with `amount: "0"`, `manageBuyOffer` with `buyAmount: "0"`).
+4. **Exit liquidity pool positions.** An asset trustline referenced by a
+   liquidity pool (`liquidity_pool_use_count > 0`, per CAP-0038) cannot be
+   deleted — withdraw from the pool and remove the pool-share trustline first.
+
+```typescript
+// 1. Check the trustline is deletable
+const account = await server.loadAccount(userPublicKey);
+const trustline = account.balances.find(
+  (b) =>
+    b.asset_type !== "native" &&
+    b.asset_type !== "liquidity_pool_shares" &&
+    b.asset_code === asset.getCode() &&
+    b.asset_issuer === asset.getIssuer()
+);
+
+if (!trustline) throw new Error("No trustline (display/claimable state only?)");
+if (parseFloat(trustline.balance) !== 0)
+  throw new Error("Balance must be 0 — send funds away or back to issuer");
+if (parseFloat(trustline.buying_liabilities) !== 0)
+  throw new Error("Cancel open offers buying this asset first");
+
+// Liquidity-pool usage (precondition 4) is not visible on this balance line —
+// if the asset is still in one of the account's pools, the submit below fails
+// with op_cannot_delete. Withdraw and remove the pool-share trustline first.
+
+// 2. Submit removal and surface the specific result code
+const removeTrustTx = new StellarSdk.TransactionBuilder(account, {
+  fee: StellarSdk.BASE_FEE,
+  networkPassphrase: StellarSdk.Networks.TESTNET,
+})
+  .addOperation(
+    StellarSdk.Operation.changeTrust({
+      asset: asset,
+      limit: "0", // Delete the trustline
+    })
+  )
+  .setTimeout(180)
+  .build();
+
+removeTrustTx.sign(userKeypair);
+
+try {
+  await server.submitTransaction(removeTrustTx);
+} catch (e) {
+  const codes = e.response?.data?.extras?.result_codes?.operations ?? [];
+  if (codes.includes("op_invalid_limit")) {
+    // CHANGE_TRUST_INVALID_LIMIT: balance or buying liabilities remain
+    throw new Error("Clear balance and open offers before removing trustline");
+  }
+  if (codes.includes("op_cannot_delete")) {
+    // CHANGE_TRUST_CANNOT_DELETE: trustline is used by a liquidity pool
+    throw new Error("Withdraw from liquidity pools referencing this asset first");
+  }
+  throw e;
+}
 ```
 
 ### Check Trustline Status
@@ -258,7 +331,7 @@ if (trustline) {
 
 ## Stellar Asset Contract (SAC)
 
-SAC provides Soroban interface for Stellar Assets, enabling smart contract interactions.
+SAC provides a smart-contract interface for Stellar Assets, enabling smart contract interactions.
 
 ### Deploy SAC for Existing Asset
 
@@ -266,7 +339,7 @@ SAC provides Soroban interface for Stellar Assets, enabling smart contract inter
 # Get the SAC address for an asset
 stellar contract asset deploy \
   --asset USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN \
-  --source alice \
+  --source-account alice \
   --network testnet
 ```
 
@@ -280,7 +353,7 @@ const contractId = asset.contractId(StellarSdk.Networks.TESTNET);
 // Returns the deterministic SAC contract address
 ```
 
-### Using SAC in Soroban Contracts
+### Using SAC in Smart Contracts
 
 ```rust
 use soroban_sdk::{token::Client as TokenClient, Address, Env};
@@ -302,7 +375,7 @@ pub fn transfer_asset(
 
 ### SAC vs Custom Token Interface
 
-SAC implements the standard Soroban token interface:
+SAC implements the standard SEP-41 token interface:
 - `balance(id: Address) -> i128`
 - `transfer(from: Address, to: Address, amount: i128)`
 - `approve(from: Address, spender: Address, amount: i128, expiration_ledger: u32)`
@@ -320,15 +393,49 @@ SAC implements the standard Soroban token interface:
 - Performance critical (classic operations are cheaper)
 - DEX integration via order book
 
-### Use Soroban Custom Tokens When:
+### Use Custom Contract Tokens When:
 - Complex transfer logic (royalties, fees, restrictions)
 - Custom authorization schemes
 - Non-standard token behaviors
 - Integration with custom DeFi contracts
 - NFTs or semi-fungible tokens
 
+> Reach for a fully custom token as a last resort. Many of the cases above
+> (royalties, fees, transfer restrictions) can be built with a regular
+> issued Stellar asset plus a thin "SAC admin" contract that drives the
+> SAC's `mint`, `burn`, and `clawback` functions. That keeps the ecosystem
+> compatibility of a normal asset (DEX, anchors, wallets, trustlines) while
+> still layering on custom logic. Prefer a custom contract token only when
+> you need token behavior the SAC genuinely cannot express.
+>
+> **This runs in production today.** USDT0
+> (`USDT0:GATISXX6BZ6NC7IKQBY37CJD4SOZL3CYZJWXEDG6JVIY4WBS6KXJHN6Q`) is a
+> classic asset whose SAC admin is a contract: a role-gated manager that
+> forwards `mint`, `clawback`, `set_authorized`, and `set_admin` to the SAC,
+> with a cross-chain bridge holding only the minter role. See
+> [setting a custom SAC admin](https://developers.stellar.org/docs/build/guides/tokens/custom-sac-admin)
+> for the pattern and `../cross-chain/layerzero.md` for that deployment.
+>
+> One hard prerequisite: **lock the issuer account completely.** Payments
+> from a classic issuer are minting, so an unlocked issuer can mint outside
+> the contract and bypass the role model entirely. Master key weight `0`
+> disables only the master key: any other signers whose combined weight
+> meets the medium threshold can still issue, and signers meeting the high
+> threshold can restore the master key. So remove every other signer (or
+> confirm their combined weight can never meet the thresholds), as in
+> [Lock Issuing Account](#lock-issuing-account).
+>
+> **Do it in this order: `set_admin` first, then lock the issuer.** A SAC's
+> admin starts as the issuer account, and only the *current* admin can
+> authorize the first `set_admin`. Lock the issuer completely before that
+> call and the admin stays the locked issuer forever, because no signer can
+> authorize the handover
+> ([SAC admin guide](https://developers.stellar.org/docs/build/guides/tokens/custom-sac-admin)).
+> After the handover the SAC still mints under the new admin, so lock the
+> issuer then.
+
 ### Use SAC When:
-- Need Stellar Asset in Soroban contract
+- Need a Stellar asset inside a smart contract
 - Building DeFi protocols with existing assets
 - Bridge between classic and smart contract operations
 
@@ -396,32 +503,25 @@ desc = "A description of my token"
 image = "https://example.com/token-logo.png"
 ```
 
+### SEP-0008 (Regulated Assets)
+
+Use [SEP-0008](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0008.md) when the issuer must approve each transaction, not just each trustline. The issuer sets `AUTH_REQUIRED` and `AUTH_REVOCABLE`, publishes `regulated`, `approval_server` and `approval_criteria` in `[[CURRENCIES]]`, and runs an approval server that signs compliant transactions. Wallets POST each signed transaction to it and handle `success`, `revised`, `pending`, `action_required` and `rejected`. Setup, transaction shape and the full wallet flow: [regulated-assets.md](regulated-assets.md). For permissioned contract tokens, see SEP-0057 (T-REX, Draft) in [`../standards/SKILL.md`](../standards/SKILL.md).
+
 ### SEP-0010 (Web Authentication)
 
-Authenticate users with their Stellar accounts:
-
-```typescript
-// Server generates challenge
-// Client signs with wallet
-// Server verifies signature
-```
+Authenticate users with their Stellar accounts. Flow: the server generates a challenge transaction, the client signs it with their wallet, and the server verifies the signature. See [SEP-0010](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md).
 
 ### SEP-0024 (Hosted Deposit/Withdrawal)
 
-For fiat on/off ramps:
-
-```typescript
-// Interactive flow for deposits/withdrawals
-// Anchor handles KYC and fiat transfer
-```
+For fiat on/off ramps: an interactive webview flow where the anchor handles KYC and the fiat transfer. See [SEP-0024](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md).
 
 ### SEP-0045 (Web Auth for Contract Accounts)
 
-Extends SEP-10 to support Soroban contract accounts (`C...` addresses) for web authentication. Required for smart wallet / passkey-based anchor integrations. See [SEP-0045](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0045.md).
+Extends SEP-10 to support contract accounts (`C...` addresses) for web authentication. Required for smart wallet / passkey-based anchor integrations. Draft status; verify current status in [SEP-0045](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0045.md).
 
 ### SEP-0050 (Non-Fungible Tokens)
 
-Standard contract interface for NFTs on Soroban. Reference implementations available in [OpenZeppelin Stellar Contracts](https://github.com/OpenZeppelin/stellar-contracts) with Base, Consecutive, and Enumerable variants. See [SEP-0050](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0050.md).
+Standard contract interface for NFTs on Stellar. Reference implementations available in [OpenZeppelin Stellar Contracts](https://github.com/OpenZeppelin/stellar-contracts) with Base, Consecutive, and Enumerable variants. Draft status; verify current status in [SEP-0050](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0050.md).
 
 ## Best Practices
 
@@ -436,9 +536,23 @@ Standard contract interface for NFTs on Soroban. Reference implementations avail
 - Handle trustline creation in onboarding flow
 - Respect trustline limits
 - Monitor for frozen/deauthorized status
+- Before removing a trustline (`limit: "0"`): zero the balance, cancel offers
+  buying the asset, and exit liquidity pools that reference it
 
 ### Security
 - Validate asset issuer, not just code
 - Be cautious of assets with clawback enabled
 - Verify stellar.toml from authoritative source
 - Use well-known asset lists for common tokens
+- **Some live assets have no `stellar.toml` at all.** A missing `home_domain`
+  is not evidence of a scam — USDT0 ships without one. Validate by issuer
+  plus SAC derivation, never by the presence of `home_domain` or a
+  `[[CURRENCIES]]` entry
+- **When `AUTH_REVOCABLE` and `AUTH_CLAWBACK_ENABLED` are both set, check the
+  issuer lock *and* the admin roles before listing the asset.** Those flags
+  mean balances can be frozen or clawed back. A contract SAC admin does not
+  contain that power on its own: an issuer whose master key still signs can
+  mint, freeze and claw back directly, whatever the admin contract allows. So
+  confirm the master key weight is `0` and no other signers remain (or their
+  combined weight can never meet any threshold: freezing needs only the low
+  one), then identify who holds the admin contract's roles
